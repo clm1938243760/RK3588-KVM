@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.log
 *.tmp
+mediamtx_*_linux_arm64.tar.gz
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

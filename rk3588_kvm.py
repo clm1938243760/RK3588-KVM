@@ -2,16 +2,23 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import errno
+import hashlib
 import json
 import os
 import re
+import socket
+import struct
 import subprocess
 import threading
 import time
+from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlsplit
 
 import cv2
 import numpy as np
@@ -21,6 +28,14 @@ SCREEN_H = 1080
 KEY_HOLD_SECONDS = 0.025
 KEY_RELEASE_SECONDS = 0.025
 MOUSE_SETTLE_SECONDS = 0.0
+MOUSE_DOUBLE_CLICK_DOWN_SECONDS = 0.05
+MOUSE_DOUBLE_CLICK_UP_SECONDS = 0.08
+MOUSE_WS_PACKET_SIZE = 6
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MOUSE_EVENT_MOVE = 0
+MOUSE_EVENT_DOWN = 1
+MOUSE_EVENT_UP = 2
+MOUSE_EVENT_DBLCLICK = 3
 
 KEY: dict[str, tuple[int, int]] = {
     "\n": (0, 0x28),
@@ -125,7 +140,17 @@ def clamp_int(value: Any, low: int, high: int) -> int:
     return max(low, min(high, parsed))
 
 
-def html_page(width: int, height: int) -> bytes:
+def html_page(width: int, height: int, webrtc: bool = False) -> bytes:
+    media = (
+        '<iframe id="video" class="video-layer" allow="autoplay; fullscreen" scrolling="no"></iframe>'
+        if webrtc
+        else '<img id="video" class="video-layer" src="/stream.mjpg" draggable="false" />'
+    )
+    webrtc_setup = (
+        'document.getElementById("video").src = "http://" + location.hostname + ":8889/kvm?autoplay=true&muted=true&controls=false";'
+        if webrtc
+        else ""
+    )
     body = f"""<!doctype html>
 <html>
 <head>
@@ -136,7 +161,13 @@ def html_page(width: int, height: int) -> bytes:
 html, body {{ margin: 0; height: 100%; background: #111827; color: #e5e7eb; font-family: Arial, sans-serif; }}
 #top {{ height: 42px; display: flex; align-items: center; gap: 16px; padding: 0 14px; background: #0f172a; }}
 #stage {{ height: calc(100% - 42px); display: flex; align-items: center; justify-content: center; overflow: hidden; }}
-#screen {{ max-width: 100%; max-height: 100%; object-fit: contain; outline: none; user-select: none; cursor: crosshair; }}
+#viewport {{ position: relative; width: min(100%, calc((100vh - 42px) * 16 / 9)); aspect-ratio: 16 / 9; }}
+.video-layer, #screen {{ position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }}
+.video-layer {{ object-fit: contain; pointer-events: none; background: #000; }}
+#screen {{ outline: none; user-select: none; cursor: crosshair; z-index: 2; }}
+#cursor {{ position: absolute; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.95); border-radius: 999px; box-shadow: 0 0 0 1px rgba(15,23,42,0.7); pointer-events: none; z-index: 3; transform: translate(-50%, -50%) scale(1); opacity: 0; transition: opacity 120ms linear, transform 90ms ease-out; }}
+#cursor.active {{ opacity: 1; }}
+#cursor.clicking {{ transform: translate(-50%, -50%) scale(0.86); }}
 button {{ background: #2563eb; color: white; border: 0; border-radius: 4px; padding: 7px 10px; }}
 #state {{ color: #9ca3af; font-size: 13px; }}
 </style>
@@ -148,14 +179,29 @@ button {{ background: #2563eb; color: white; border: 0; border-radius: 4px; padd
   <span id="state">video {width}x{height}, click image then type</span>
 </div>
 <div id="stage">
-  <img id="screen" src="/stream.mjpg" tabindex="0" draggable="false" />
+  <div id="viewport">
+    {media}
+    <div id="screen" tabindex="0"></div>
+    <div id="cursor"></div>
+  </div>
 </div>
 <script>
 const W = {width};
 const H = {height};
+const EVT_MOVE = {MOUSE_EVENT_MOVE};
+const EVT_DOWN = {MOUSE_EVENT_DOWN};
+const EVT_UP = {MOUSE_EVENT_UP};
+const EVT_DBLCLICK = {MOUSE_EVENT_DBLCLICK};
+{webrtc_setup}
 const img = document.getElementById("screen");
 const state = document.getElementById("state");
-let lastMove = 0;
+const cursor = document.getElementById("cursor");
+let mouseSocket = null;
+let mouseSocketTimer = null;
+let pendingMove = null;
+let moveDrainQueued = false;
+let predictedCursor = null;
+let clickPulseTimer = null;
 
 function coords(ev) {{
   const r = img.getBoundingClientRect();
@@ -163,6 +209,45 @@ function coords(ev) {{
     x: Math.max(0, Math.min(W - 1, Math.round((ev.clientX - r.left) * W / r.width))),
     y: Math.max(0, Math.min(H - 1, Math.round((ev.clientY - r.top) * H / r.height)))
   }};
+}}
+
+function viewportPosition(ev) {{
+  const r = img.getBoundingClientRect();
+  return {{
+    left: Math.max(0, Math.min(r.width, ev.clientX - r.left)),
+    top: Math.max(0, Math.min(r.height, ev.clientY - r.top))
+  }};
+}}
+
+function viewportPositionFromCoords(x, y) {{
+  const r = img.getBoundingClientRect();
+  return {{
+    left: Math.max(0, Math.min(r.width, x * r.width / Math.max(W - 1, 1))),
+    top: Math.max(0, Math.min(r.height, y * r.height / Math.max(H - 1, 1)))
+  }};
+}}
+
+function paintCursorAt(x, y) {{
+  const pos = viewportPositionFromCoords(x, y);
+  cursor.style.left = pos.left + "px";
+  cursor.style.top = pos.top + "px";
+  cursor.classList.add("active");
+}}
+
+function updateCursor(ev) {{
+  const c = coords(ev);
+  predictedCursor = c;
+  paintCursorAt(c.x, c.y);
+  return c;
+}}
+
+function pulseCursor() {{
+  cursor.classList.add("clicking");
+  if (clickPulseTimer) window.clearTimeout(clickPulseTimer);
+  clickPulseTimer = window.setTimeout(() => {{
+    cursor.classList.remove("clicking");
+    clickPulseTimer = null;
+  }}, 90);
 }}
 
 async function post(path, payload) {{
@@ -178,30 +263,109 @@ async function post(path, payload) {{
   }}
 }}
 
+function mousePacket(type, button, x, y) {{
+  const buf = new ArrayBuffer(6);
+  const view = new DataView(buf);
+  view.setUint8(0, type);
+  view.setUint8(1, button & 0xff);
+  view.setUint16(2, x, true);
+  view.setUint16(4, y, true);
+  return buf;
+}}
+
+function mouseFallback(type, button, x, y) {{
+  const payload = {{ x, y, button }};
+  if (type === EVT_DOWN) payload.type = "down";
+  else if (type === EVT_UP) payload.type = "up";
+  else if (type === EVT_DBLCLICK) payload.type = "dblclick";
+  else payload.type = "move";
+  post("/api/mouse", payload);
+}}
+
+function scheduleMouseSocketReconnect(delayMs = 1000) {{
+  if (mouseSocketTimer) return;
+  mouseSocketTimer = window.setTimeout(() => {{
+    mouseSocketTimer = null;
+    ensureMouseSocket();
+  }}, delayMs);
+}}
+
+function ensureMouseSocket() {{
+  if (mouseSocket && (mouseSocket.readyState === WebSocket.OPEN || mouseSocket.readyState === WebSocket.CONNECTING)) return;
+  const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+  mouseSocket = new WebSocket(scheme + location.host + "/ws/input");
+  mouseSocket.binaryType = "arraybuffer";
+  mouseSocket.onopen = () => {{
+    state.textContent = "video {width}x{height}, websocket latest-only input ready";
+  }};
+  mouseSocket.onclose = () => {{
+    state.textContent = "input reconnecting...";
+    scheduleMouseSocketReconnect();
+  }};
+  mouseSocket.onerror = () => {{
+    if (mouseSocket && mouseSocket.readyState !== WebSocket.OPEN) {{
+      state.textContent = "input websocket unavailable, fallback active";
+    }}
+  }};
+}}
+
+function sendMouse(type, button, x, y) {{
+  predictedCursor = {{ x, y }};
+  paintCursorAt(x, y);
+  if (type !== EVT_MOVE) pulseCursor();
+  const packet = mousePacket(type, button, x, y);
+  if (mouseSocket && mouseSocket.readyState === WebSocket.OPEN) {{
+    if (type === EVT_MOVE && mouseSocket.bufferedAmount > 1024) return;
+    mouseSocket.send(packet);
+    return;
+  }}
+  mouseFallback(type, button, x, y);
+}}
+
+function queueMoveSend() {{
+  if (moveDrainQueued) return;
+  moveDrainQueued = true;
+  requestAnimationFrame(() => {{
+    moveDrainQueued = false;
+    if (!pendingMove) return;
+    const move = pendingMove;
+    pendingMove = null;
+    sendMouse(EVT_MOVE, move.buttons, move.x, move.y);
+  }});
+}}
+
 img.addEventListener("pointermove", ev => {{
-  const now = performance.now();
-  if (now - lastMove < 16) return;
-  lastMove = now;
-  post("/api/mouse", {{ type: "move", ...coords(ev), buttons: ev.buttons }});
+  const c = updateCursor(ev);
+  pendingMove = {{ ...c, buttons: ev.buttons }};
+  queueMoveSend();
 }});
 
 img.addEventListener("pointerdown", ev => {{
   img.focus();
   ev.preventDefault();
-  post("/api/mouse", {{ type: "down", ...coords(ev), button: ev.button }});
+  const c = updateCursor(ev);
+  try {{ img.setPointerCapture(ev.pointerId); }} catch (e) {{}}
+  sendMouse(EVT_DOWN, ev.button, c.x, c.y);
 }});
 
 img.addEventListener("pointerup", ev => {{
   ev.preventDefault();
-  post("/api/mouse", {{ type: "up", ...coords(ev), button: ev.button }});
+  const c = updateCursor(ev);
+  try {{ img.releasePointerCapture(ev.pointerId); }} catch (e) {{}}
+  sendMouse(EVT_UP, ev.button, c.x, c.y);
 }});
 
 img.addEventListener("dblclick", ev => {{
   ev.preventDefault();
-  post("/api/mouse", {{ type: "dblclick", ...coords(ev), button: ev.button }});
+  const c = updateCursor(ev);
+  sendMouse(EVT_DBLCLICK, ev.button, c.x, c.y);
 }});
 
 img.addEventListener("contextmenu", ev => ev.preventDefault());
+img.addEventListener("pointerleave", () => {{
+  if (!predictedCursor) cursor.classList.remove("active");
+}});
+window.addEventListener("blur", () => cursor.classList.remove("active"));
 
 window.addEventListener("keydown", ev => {{
   if (document.activeElement !== img) return;
@@ -218,6 +382,7 @@ window.addEventListener("keydown", ev => {{
 }});
 
 document.getElementById("focus").onclick = () => img.focus();
+ensureMouseSocket();
 img.focus();
 </script>
 </body>
@@ -235,6 +400,7 @@ class FrameGrabber:
         self.quality = max(40, min(95, quality))
         self.scale_width = scale_width
         self._latest: Optional[bytes] = None
+        self._latest_frame: Optional[np.ndarray] = None
         self._latest_at = 0.0
         self._frame_id = 0
         self._frame_count = 0
@@ -249,6 +415,19 @@ class FrameGrabber:
     def latest(self) -> tuple[int, Optional[bytes]]:
         with self._lock:
             return self._frame_id, self._latest
+
+    def latest_full_jpeg(self, quality: int | None = None) -> tuple[int, Optional[bytes], float | None]:
+        with self._lock:
+            frame_id = self._frame_id
+            frame = None if self._latest_frame is None else self._latest_frame.copy()
+            age = None if not self._latest_at else time.monotonic() - self._latest_at
+        if frame is None:
+            return frame_id, None, age
+        encode_quality = max(40, min(95, quality if quality is not None else 90))
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), encode_quality])
+        if not ok:
+            return frame_id, None, age
+        return frame_id, encoded.tobytes(), age
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -270,6 +449,14 @@ class FrameGrabber:
     def _store(self, jpeg: bytes) -> None:
         with self._lock:
             self._latest = jpeg
+            self._latest_at = time.monotonic()
+            self._frame_id += 1
+            self._frame_count += 1
+
+    def _store_frame_and_preview(self, frame: np.ndarray, preview_jpeg: bytes) -> None:
+        with self._lock:
+            self._latest_frame = frame.copy()
+            self._latest = preview_jpeg
             self._latest_at = time.monotonic()
             self._frame_id += 1
             self._frame_count += 1
@@ -395,7 +582,12 @@ class FrameGrabber:
             ]
             try:
                 subprocess.run(cmd, check=True, timeout=4)
-                self._store(tmp.read_bytes())
+                jpeg = tmp.read_bytes()
+                frame = cv2.imread(str(tmp))
+                if frame is not None:
+                    self._store_frame_and_preview(frame, jpeg)
+                else:
+                    self._store(jpeg)
                 with self._lock:
                     self._active_pipeline = "gst-launch snapshot fallback"
                     self._last_error = ""
@@ -406,12 +598,186 @@ class FrameGrabber:
             self._stop.wait(frame_interval)
 
     def _encode_store(self, frame: np.ndarray) -> None:
+        preview = frame
         if self.scale_width and 0 < self.scale_width < frame.shape[1]:
             new_h = int(frame.shape[0] * self.scale_width / frame.shape[1])
-            frame = cv2.resize(frame, (self.scale_width, new_h), interpolation=cv2.INTER_AREA)
-        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
+            preview = cv2.resize(frame, (self.scale_width, new_h), interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
         if ok:
-            self._store(encoded.tobytes())
+            self._store_frame_and_preview(frame, encoded.tobytes())
+
+
+class ExternalFrameGrabber:
+    def __init__(self, frame_file: str) -> None:
+        self.frame_file = Path(frame_file)
+        self._frame_id = 0
+        self._last_mtime_ns = 0
+        self._latest: Optional[bytes] = None
+        self._latest_at = 0.0
+        self._started_at = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refresh(self) -> None:
+        try:
+            stat = self.frame_file.stat()
+            if stat.st_mtime_ns == self._last_mtime_ns:
+                return
+            data = self.frame_file.read_bytes()
+            if len(data) < 4 or not data.startswith(b"\xff\xd8") or not data.endswith(b"\xff\xd9"):
+                return
+        except (FileNotFoundError, OSError):
+            return
+        with self._lock:
+            self._latest = data
+            self._latest_at = time.monotonic()
+            self._last_mtime_ns = stat.st_mtime_ns
+            self._frame_id += 1
+
+    def latest(self) -> tuple[int, Optional[bytes]]:
+        self._refresh()
+        with self._lock:
+            return self._frame_id, self._latest
+
+    def latest_full_jpeg(self, quality: int | None = None) -> tuple[int, Optional[bytes], float | None]:
+        self._refresh()
+        with self._lock:
+            age = None if not self._latest_at else time.monotonic() - self._latest_at
+            return self._frame_id, self._latest, age
+
+    def status(self) -> dict[str, Any]:
+        self._refresh()
+        with self._lock:
+            age = None if not self._latest_at else time.monotonic() - self._latest_at
+            return {
+                "frame_age": age,
+                "frame_id": self._frame_id,
+                "frame_bytes": len(self._latest or b""),
+                "capture_fps": None,
+                "active_pipeline": "external MPP H264/WebRTC",
+                "last_error": "" if self._latest is not None else f"frame file not ready: {self.frame_file}",
+            }
+
+    def close(self) -> None:
+        return
+
+
+class MouseInputDispatcher:
+    def __init__(self, hid: "HidDevices") -> None:
+        self.hid = hid
+        self._condition = threading.Condition()
+        self._actions: deque[tuple[int, int, int, int]] = deque()
+        self._latest_move: Optional[tuple[int, int, int, int]] = None
+        self._stop = False
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
+        self._thread.join(timeout=2.0)
+
+    def queue_move(self, buttons: int, x: int, y: int) -> None:
+        with self._condition:
+            self._latest_move = (MOUSE_EVENT_MOVE, buttons & 0x07, x, y)
+            self._condition.notify()
+
+    def queue_action(self, event_type: int, button: int, x: int, y: int) -> None:
+        with self._condition:
+            self._actions.append((event_type, button & 0x07, x, y))
+            self._condition.notify()
+
+    def status(self) -> dict[str, Any]:
+        with self._condition:
+            latest_move = None if self._latest_move is None else {
+                "x": self._latest_move[2],
+                "y": self._latest_move[3],
+                "buttons": self._latest_move[1],
+            }
+            return {
+                "mouse_queue_mode": "latest-only-move",
+                "mouse_action_backlog": len(self._actions),
+                "mouse_has_pending_move": self._latest_move is not None,
+                "mouse_latest_move": latest_move,
+            }
+
+    def enqueue_packet(self, payload: bytes) -> bool:
+        event = decode_mouse_packet(payload, self.hid.width, self.hid.height)
+        return self._enqueue_event(event)
+
+    def enqueue_payload(self, payload: dict[str, Any]) -> bool:
+        event_type = str(payload.get("type") or "move")
+        x = clamp_int(payload.get("x"), 0, self.hid.width - 1)
+        y = clamp_int(payload.get("y"), 0, self.hid.height - 1)
+        button = clamp_int(payload.get("button"), 0, 2)
+        if event_type == "down":
+            event = (MOUSE_EVENT_DOWN, HidDevices._button_mask(button), x, y)
+        elif event_type == "up":
+            event = (MOUSE_EVENT_UP, 0, x, y)
+        elif event_type == "dblclick":
+            event = (MOUSE_EVENT_DBLCLICK, HidDevices._button_mask(button), x, y)
+        else:
+            event = (MOUSE_EVENT_MOVE, clamp_int(payload.get("buttons"), 0, 7), x, y)
+        return self._enqueue_event(event)
+
+    def _enqueue_event(self, event: tuple[int, int, int, int] | None) -> bool:
+        if event is None:
+            return False
+        event_type, button, x, y = event
+        if event_type == MOUSE_EVENT_MOVE:
+            self.queue_move(button, x, y)
+        else:
+            self.queue_action(event_type, button, x, y)
+        return True
+
+    def _loop(self) -> None:
+        while True:
+            with self._condition:
+                while not self._stop and not self._actions and self._latest_move is None:
+                    self._condition.wait(timeout=0.5)
+                if self._stop:
+                    return
+                if self._actions:
+                    event = self._actions.popleft()
+                else:
+                    event = self._latest_move
+                    self._latest_move = None
+            if event is not None:
+                try:
+                    self._dispatch(*event)
+                except OSError as exc:
+                    print(f"mouse dispatch error: {exc}", flush=True)
+                    time.sleep(0.02)
+
+    def _dispatch(self, event_type: int, button: int, x: int, y: int) -> None:
+        if event_type == MOUSE_EVENT_DOWN:
+            self.hid.write_mouse(button, x, y)
+            return
+        if event_type == MOUSE_EVENT_UP:
+            self.hid.write_mouse(0, x, y)
+            return
+        if event_type == MOUSE_EVENT_DBLCLICK:
+            for _ in range(2):
+                self.hid.write_mouse(button, x, y)
+                time.sleep(MOUSE_DOUBLE_CLICK_DOWN_SECONDS)
+                self.hid.write_mouse(0, x, y)
+                time.sleep(MOUSE_DOUBLE_CLICK_UP_SECONDS)
+            return
+        self.hid.write_mouse(0, x, y)
+        time.sleep(MOUSE_SETTLE_SECONDS)
+
+
+def decode_mouse_packet(payload: bytes, width: int, height: int) -> tuple[int, int, int, int] | None:
+    if len(payload) != MOUSE_WS_PACKET_SIZE:
+        return None
+    event_type, button, x, y = struct.unpack("<BBHH", payload)
+    if event_type not in (MOUSE_EVENT_MOVE, MOUSE_EVENT_DOWN, MOUSE_EVENT_UP, MOUSE_EVENT_DBLCLICK):
+        return None
+    x = clamp_int(x, 0, width - 1)
+    y = clamp_int(y, 0, height - 1)
+    if event_type == MOUSE_EVENT_MOVE:
+        return event_type, button & 0x07, x, y
+    return event_type, HidDevices._button_mask(clamp_int(button, 0, 2)), x, y
 
 
 class HidDevices:
@@ -455,21 +821,17 @@ class HidDevices:
 
     def _keyboard_fd_locked(self) -> int:
         if self._keyboard_fd is None:
-            self._keyboard_fd = os.open(self.keyboard, os.O_RDWR | getattr(os, "O_NONBLOCK", 0))
+            self._keyboard_fd = os.open(self.keyboard, os.O_RDWR)
         return self._keyboard_fd
 
     def _mouse_fd_locked(self) -> int:
         if self._mouse_fd is None:
-            self._mouse_fd = os.open(self.mouse, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0))
+            self._mouse_fd = os.open(self.mouse, os.O_WRONLY)
         return self._mouse_fd
 
     def _write_keyboard(self, report: bytes) -> None:
         with self._keyboard_lock:
-            try:
-                os.write(self._keyboard_fd_locked(), report)
-            except OSError:
-                self._close_keyboard_locked()
-                os.write(self._keyboard_fd_locked(), report)
+            self._write_with_retry(self._keyboard_fd_locked, self._close_keyboard_locked, report)
 
     def press_key(self, mod: int, code: int) -> None:
         self._write_keyboard(bytes([mod & 0xFF, 0, code & 0xFF, 0, 0, 0, 0, 0]))
@@ -522,11 +884,36 @@ class HidDevices:
 
     def write_mouse(self, button: int, x: int, y: int) -> None:
         with self._mouse_lock:
+            self._write_with_retry(self._mouse_fd_locked, self._close_mouse_locked, self._mouse_report(button, x, y))
+
+    @staticmethod
+    def _write_with_retry(
+        open_fd: Any,
+        close_fd: Any,
+        report: bytes,
+        retries: int = 4,
+        delay_seconds: float = 0.01,
+    ) -> None:
+        last_error: OSError | None = None
+        for _ in range(retries):
             try:
-                os.write(self._mouse_fd_locked(), self._mouse_report(button, x, y))
-            except OSError:
-                self._close_mouse_locked()
-                os.write(self._mouse_fd_locked(), self._mouse_report(button, x, y))
+                os.write(open_fd(), report)
+                return
+            except BlockingIOError as exc:
+                last_error = exc
+                time.sleep(delay_seconds)
+            except OSError as exc:
+                last_error = exc
+                close_fd()
+                if exc.errno in (errno.EAGAIN, errno.EBUSY):
+                    time.sleep(delay_seconds)
+                    continue
+                if exc.errno in (errno.EPIPE, errno.ENODEV, errno.ESHUTDOWN, errno.EIO, errno.EBADF, errno.ENXIO):
+                    time.sleep(delay_seconds)
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
 
     def mouse_event(self, payload: dict[str, Any]) -> None:
         event_type = str(payload.get("type") or "move")
@@ -551,17 +938,22 @@ class HidDevices:
 class KvmState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.grabber = FrameGrabber(
-            device=args.video,
-            width=args.width,
-            height=args.height,
-            fps=args.fps,
-            quality=args.quality,
-            scale_width=args.scale_width,
-        )
+        if args.frame_file:
+            self.grabber = ExternalFrameGrabber(args.frame_file)
+        else:
+            self.grabber = FrameGrabber(
+                device=args.video,
+                width=args.width,
+                height=args.height,
+                fps=args.fps,
+                quality=args.quality,
+                scale_width=args.scale_width,
+            )
         self.hid = HidDevices(args.keyboard, args.mouse, args.width, args.height)
+        self.mouse_input = MouseInputDispatcher(self.hid)
 
     def close(self) -> None:
+        self.mouse_input.close()
         self.grabber.close()
         self.hid.close()
 
@@ -574,26 +966,45 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.state  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        if self.path == "/stream.mjpg" or self.path.startswith("/api/mouse"):
+        path = urlsplit(self.path).path
+        if path == "/stream.mjpg" or path.startswith("/api/mouse") or path == "/ws/input":
             return
         print("%s - %s" % (self.address_string(), fmt % args), flush=True)
 
     def do_GET(self) -> None:
-        if self.path == "/" or self.path.startswith("/?"):
-            body = html_page(self.state.args.width, self.state.args.height)
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        if path == "/ws/input":
+            self._handle_input_websocket()
+            return
+        if path == "/":
+            body = html_page(self.state.args.width, self.state.args.height, self.state.args.webrtc)
             self._send_bytes(body, "text/html; charset=utf-8")
             return
-        if self.path == "/stream.mjpg":
+        if path == "/stream.mjpg":
             self._stream()
             return
-        if self.path == "/api/status":
+        if path == "/api/status":
             status = {
                 "ok": True,
                 "video": self.state.args.video,
                 **self.state.grabber.status(),
                 **self.state.hid.status(),
+                **self.state.mouse_input.status(),
             }
             self._send_json(status)
+            return
+        if path == "/api/frame.jpg":
+            query = parse_qs(parsed.query)
+            quality = self._parse_quality(query.get("quality", ["90"])[0])
+            frame_id, frame, age = self.state.grabber.latest_full_jpeg(quality)
+            if frame is None:
+                self._send_json({"ok": False, "error": "frame not ready"}, status=503)
+                return
+            headers = {"X-Frame-Id": str(frame_id)}
+            if age is not None:
+                headers["X-Frame-Age"] = f"{age:.3f}"
+            self._send_bytes(frame, "image/jpeg", headers=headers)
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -601,8 +1012,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             if self.path == "/api/mouse":
-                self.state.hid.mouse_event(payload)
-                self._send_json({"ok": True})
+                ok = self.state.mouse_input.enqueue_payload(payload)
+                self._send_json({"ok": ok})
                 return
             if self.path == "/api/key":
                 ok = self.state.hid.key_event(payload)
@@ -623,14 +1034,30 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self._send_bytes(body, "application/json; charset=utf-8", status)
 
-    def _send_bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
+    def _send_bytes(
+        self,
+        body: bytes,
+        content_type: str,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
+        if headers:
+            for key, value in headers.items():
+                self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
+
+    @staticmethod
+    def _parse_quality(value: str) -> int:
+        try:
+            return max(40, min(95, int(value)))
+        except (TypeError, ValueError):
+            return 90
 
     def _stream(self) -> None:
         boundary = "rk3588kvm"
@@ -659,6 +1086,86 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 return
 
+    def _handle_input_websocket(self) -> None:
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self.send_error(HTTPStatus.BAD_REQUEST, "expected websocket upgrade")
+            return
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if not key:
+            self.send_error(HTTPStatus.BAD_REQUEST, "missing websocket key")
+            return
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.close_connection = True
+        try:
+            self.connection.settimeout(30.0)
+            while True:
+                opcode, payload = self._ws_read_frame()
+                if opcode is None:
+                    return
+                if opcode == 0x8:
+                    self._ws_send_frame(0x8, payload)
+                    return
+                if opcode == 0x9:
+                    self._ws_send_frame(0xA, payload)
+                    continue
+                if opcode != 0x2:
+                    continue
+                if not self.state.mouse_input.enqueue_packet(payload):
+                    self._ws_send_frame(0x8, b"")
+                    return
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            return
+
+    def _ws_read_frame(self) -> tuple[int | None, bytes]:
+        header = self.rfile.read(2)
+        if len(header) < 2:
+            return None, b""
+        first, second = header
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            ext = self.rfile.read(2)
+            if len(ext) < 2:
+                return None, b""
+            length = struct.unpack(">H", ext)[0]
+        elif length == 127:
+            ext = self.rfile.read(8)
+            if len(ext) < 8:
+                return None, b""
+            length = struct.unpack(">Q", ext)[0]
+        mask = self.rfile.read(4) if masked else b""
+        if masked and len(mask) < 4:
+            return None, b""
+        payload = self.rfile.read(length)
+        if len(payload) < length:
+            return None, b""
+        if masked:
+            payload = bytes(item ^ mask[i % 4] for i, item in enumerate(payload))
+        return opcode, payload
+
+    def _ws_send_frame(self, opcode: int, payload: bytes = b"") -> None:
+        header = bytearray([0x80 | (opcode & 0x0F)])
+        length = len(payload)
+        if length < 126:
+            header.append(length)
+        elif length <= 0xFFFF:
+            header.append(126)
+            header.extend(struct.pack(">H", length))
+        else:
+            header.append(127)
+            header.extend(struct.pack(">Q", length))
+        self.connection.sendall(bytes(header) + payload)
+
 
 class KvmServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -666,6 +1173,14 @@ class KvmServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], handler: type[Handler], state: KvmState) -> None:
         super().__init__(address, handler)
         self.state = state
+
+    def get_request(self) -> tuple[socket.socket, Any]:
+        request, client_address = super().get_request()
+        try:
+            request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        return request, client_address
 
 
 def parse_args() -> argparse.Namespace:
@@ -680,6 +1195,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--quality", type=int, default=68)
     parser.add_argument("--scale-width", type=int, default=960)
+    parser.add_argument("--frame-file", default="")
+    parser.add_argument("--webrtc", action="store_true")
     return parser.parse_args()
 
 

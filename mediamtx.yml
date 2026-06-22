@@ -1,0 +1,22 @@
+logLevel: info
+writeQueueSize: 1024
+udpReadBufferSize: 4194304
+api: true
+apiAddress: 127.0.0.1:9997
+rtsp: true
+rtspAddress: :8554
+hls: false
+webrtc: true
+webrtcAddress: :8889
+webrtcEncryption: false
+webrtcAllowOrigins: ["*"]
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+webrtcAdditionalHosts: []
+
+pathDefaults:
+  source: publisher
+
+paths:
+  kvm:
+    source: udp+mpegts://127.0.0.1:5000

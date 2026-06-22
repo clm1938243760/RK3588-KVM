@@ -19,14 +19,15 @@ The KVM has three jobs:
                   HDMI RX /dev/video40
                          |
                     GStreamer tee
-                     /          \
-                    /            \
-       KMS HDMI OUT mirror      OpenCV appsink
-        kmssink connector       latest frame cache
-                    \            /
-                     \          /
-                     HTTP MJPEG stream
-                            |
+             /            |              \
+     KMS HDMI OUT    MPP H.264 encode    JPEG 2 FPS
+                         |               snapshot
+                    MPEG-TS/UDP             |
+                         |          /api/frame.jpg
+                      MediaMTX
+                         |
+                    WebRTC 1080p60
+                         |
                      Browser KVM page
                             |
                  /api/mouse and /api/key
@@ -114,9 +115,15 @@ coordinates `0..32767`.
 1. Requires root.
 2. Refuses to start if `/dev/video40`, `/dev/hidg0`, or `/dev/hidg1` is absent.
 3. Stops `lightdm` so HDMI OUT can be driven by KMS.
-4. Starts `rk3588_kvm.py` with `nohup`.
-5. Writes the PID to `/tmp/rk3588_kvm.pid`.
-6. Writes logs to `/tmp/rk3588_kvm.log`.
+4. Starts MediaMTX for WebRTC signaling and transport.
+5. Starts `stream_mpp.sh` as the only `/dev/video40` owner.
+6. Starts `rk3588_kvm.py` for the UI, HID and snapshot API.
+7. Writes separate PID and log files under `/tmp`.
+
+`stream_watchdog.sh` supervises the GStreamer worker through MediaMTX's local
+path API. It checks both `ready=true` and an increasing `inboundBytes` counter.
+Two consecutive failures restart only the stream worker, leaving HID and the
+gateway services untouched.
 
 `stop.sh` reads the PID file and terminates the KVM process.
 
@@ -129,16 +136,21 @@ unless explicitly started.
 The preferred GStreamer pipeline is:
 
 ```text
-v4l2src device=/dev/video40 io-mode=4 do-timestamp=true
+v4l2src device=/dev/video40 io-mode=2 do-timestamp=true
   ! video/x-raw,format=BGR,width=1920,height=1080,framerate=60/1
   ! tee name=t
-    t. ! queue leaky=downstream max-size-buffers=1 max-size-time=0 max-size-bytes=0
-       ! videoconvert ! videoscale
-       ! video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1
-       ! kmssink ...
-    t. ! queue leaky=downstream max-size-buffers=1 max-size-time=0 max-size-bytes=0
-       ! appsink drop=true max-buffers=1 sync=false
+    t. ! queue leaky=downstream max-size-buffers=2
+       ! mpph264enc bps=8000000 gop=30 profile=66 level=42
+         zero-copy-pkt=false
+       ! h264parse ! mpegtsmux ! udpsink port=5000
+    t. ! queue leaky=downstream max-size-buffers=1
+       ! videorate max-rate=2 ! jpegenc
+       ! multifilesink location=/tmp/rk3588_kvm_latest.jpg
 ```
+
+`io-mode=2` is mandatory on the tested board. `io-mode=4` DMA-BUF BGR input
+caused `mpp_rkvenc2` IOMMU page faults and a kernel Oops on kernel 5.10.160.
+The stable MMAP path sustained a 600-frame encoder benchmark at about 96.9 FPS.
 
 Important latency controls:
 
@@ -161,22 +173,26 @@ Endpoints:
 
 ```text
 GET  /              Browser KVM UI
-GET  /stream.mjpg   MJPEG stream
+GET  /stream.mjpg   Legacy MJPEG fallback
+GET  /api/frame.jpg Latest 1920x1080 vision snapshot
 GET  /api/status    Runtime diagnostics
 POST /api/mouse     Absolute mouse event
 POST /api/key       Keyboard event
 ```
 
-The browser stream intentionally uses a lower default resolution:
+The normal browser stream is served by MediaMTX:
 
 ```text
-scale-width: 960
-quality:     68
-fps:         20
+H.264 baseline, level 4.2
+1920x1080 input at 60 FPS
+8 Mbps CBR target
+WebRTC HTTP: 8889
+WebRTC ICE:  8189 UDP/TCP
 ```
 
-This keeps CPU and network load lower while HDMI OUT still receives the original
-1920x1080 stream.
+The Python UI embeds the MediaMTX player while a transparent overlay captures
+mouse and keyboard events. The bridge vision path continues to use a separate
+full-resolution JPEG snapshot without opening `/dev/video40`.
 
 The stream handler tracks `frame_id` and only sends a new JPEG when the capture
 thread has encoded a new frame. This prevents duplicate-frame loops from wasting
