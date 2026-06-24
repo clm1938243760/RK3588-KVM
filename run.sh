@@ -10,6 +10,8 @@ STREAM_LOG_FILE="${STREAM_LOG_FILE:-/tmp/rk3588_kvm_stream.log}"
 MEDIAMTX_PID_FILE="${MEDIAMTX_PID_FILE:-/tmp/rk3588_kvm_mediamtx.pid}"
 MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/tmp/rk3588_kvm_mediamtx.log}"
 FRAME_FILE="${FRAME_FILE:-/tmp/rk3588_kvm_latest.jpg}"
+KVM_WIDTH="${KVM_WIDTH:-1920}"
+KVM_HEIGHT="${KVM_HEIGHT:-1080}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "Please run with sudo: sudo $ROOT/run.sh"
@@ -34,11 +36,7 @@ for dev in /dev/video40 /dev/hidg0 /dev/hidg1; do
   fi
 done
 
-if systemctl is-active --quiet lightdm 2>/dev/null; then
-  echo "Stopping lightdm so HDMI OUT can be driven by KMS mirror"
-  systemctl stop lightdm || true
-  sleep 1
-fi
+echo "KVM viewport: ${KVM_WIDTH}x${KVM_HEIGHT}"
 
 KVM_ARGS=("$@")
 if [[ -x /usr/local/bin/mediamtx && "${KVM_LEGACY_MJPEG:-0}" != "1" ]]; then
@@ -56,7 +54,7 @@ else
   echo "MediaMTX unavailable; using legacy MJPEG mode"
 fi
 
-nohup "$PYTHON" "$ROOT/rk3588_kvm.py" "${KVM_ARGS[@]}" >"$LOG_FILE" 2>&1 &
+nohup "$PYTHON" "$ROOT/rk3588_kvm.py" --width "$KVM_WIDTH" --height "$KVM_HEIGHT" "${KVM_ARGS[@]}" >"$LOG_FILE" 2>&1 &
 echo "$!" > "$PID_FILE"
 echo "RK3588 KVM started: pid=$(cat "$PID_FILE")"
 echo "Log: $LOG_FILE"

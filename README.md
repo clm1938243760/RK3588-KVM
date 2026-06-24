@@ -2,15 +2,13 @@
 
 RK3588 lightweight KVM for ATK-DLRK3588 Debian boards.
 
-It reads the target computer through HDMI RX, mirrors the picture to HDMI OUT,
-and exposes a browser KVM page for remote viewing plus USB HID keyboard/mouse
-control.
+It reads the target computer through HDMI RX and exposes a browser KVM page for
+remote viewing plus USB HID keyboard/mouse control.
 
 ## Hardware Path
 
 ```text
 Target PC HDMI OUT  ->  RK3588 HDMI RX
-RK3588 HDMI OUT     ->  Monitor
 RK3588 USB gadget   ->  Target PC USB
 Browser             ->  http://<rk3588-ip>:8090
 ```
@@ -22,22 +20,22 @@ HDMI RX video node: /dev/video40
 Keyboard HID node:  /dev/hidg0
 Mouse HID node:     /dev/hidg1
 Web port:           8090
-Input resolution:   1920x1080@60
-Browser stream:     1920x1080 H.264 WebRTC, 60 FPS input
-HDMI mirror:        KMS/kmssink, forced 1920x1080 render rectangle
-Mouse input path:   Persistent WebSocket, latest-only move queue
+Input signal:       HDMI RX source timing, commonly 1920x1080@30/60
+Browser stream:     1920x1080 H.264 High WebRTC, source-matched FPS, 16 Mbps
+Mouse input path:   Persistent WebSocket, smooth latest-target queue
 ```
 
 ## Files
 
 ```text
 rk3588_kvm.py   Main KVM server
-stream_mpp.sh   HDMI RX, MPP H.264, HDMI OUT and snapshot pipeline
+stream_mpp.sh   HDMI RX, MPP H.264 and snapshot pipeline
 stream_watchdog.sh  Restarts the encoder if MediaMTX input bytes stop growing
 mediamtx.yml    WebRTC gateway configuration
 install_mediamtx.sh  MediaMTX ARM64 installer
 run.sh          Start script for the board
 stop.sh         Stop script for the board
+systemd/        Optional boot service unit
 docs/           Technical documentation
 ```
 
@@ -61,13 +59,6 @@ Click the video once before typing so the web page receives keyboard focus.
 
 ```bash
 sudo /opt/rk3588_kvm/stop.sh
-```
-
-The start script stops `lightdm` so KMS can drive HDMI OUT directly. To restore
-the Debian desktop:
-
-```bash
-sudo systemctl start lightdm
 ```
 
 ## Status API
@@ -98,29 +89,31 @@ mouse_has_pending_move Whether one latest move is waiting
 
 ## After Reboot
 
-The original gateway services can stay disabled while this KVM is tested. If the
-HID gadget nodes are missing after reboot, create the gadget manually:
+The repository includes an optional systemd unit for boot startup. Install it as
+`/etc/systemd/system/rk3588-kvm.service`, then enable it when the board should
+start KVM automatically:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now rk3588-kvm.service
+```
+
+If the HID gadget nodes are missing after reboot, create the gadget manually:
 
 ```bash
 sudo systemctl start rk3588-usb-printer-gadget.service
 sudo /opt/rk3588_kvm/run.sh
 ```
 
-Do not enable the original gateway service unless you want it to autostart.
+Do not enable the original gateway service unless you also want BRIDGE to
+autostart.
 
 ## Troubleshooting
-
-If HDMI OUT shows the Debian desktop, `lightdm` is still active:
-
-```bash
-sudo systemctl stop lightdm
-sudo /opt/rk3588_kvm/run.sh
-```
 
 If the picture is stretched, verify that the active pipeline contains:
 
 ```text
-force-aspect-ratio=false render-rectangle="<0,0,1920,1080>"
+video/x-raw,format=BGR,width=1920,height=1080
 ```
 
 If the web page works but keyboard or mouse does not, check:
@@ -146,8 +139,11 @@ the path is not ready or `inboundBytes` stops increasing twice in succession,
 it restarts only the GStreamer encoder worker. HID, BRIDGE and the KVM HTTP
 server remain online.
 
-The browser page uses a persistent WebSocket for mouse input. Move events are
-latest-only on both the browser side and the board side: old move samples are
-dropped, while button down/up/double-click actions stay ordered.
+The browser page uses a persistent WebSocket for mouse input. Move events stay
+latest-only on the network side to avoid backlog. The board then smooths large
+absolute-mouse jumps into short HID steps, while button down/up/double-click
+actions stay ordered and immediate.
 
-More details are in [docs/TECHNICAL_DESIGN.md](docs/TECHNICAL_DESIGN.md).
+More details are in:
+
+- [docs/TECHNICAL_DESIGN.md](docs/TECHNICAL_DESIGN.md)

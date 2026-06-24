@@ -7,11 +7,10 @@ It is intentionally separate from the larger gateway project. The original
 gateway files remain in `/opt/rk3588_gateway`, while this KVM runs from
 `/opt/rk3588_kvm`.
 
-The KVM has three jobs:
+The KVM has two jobs:
 
 1. Capture the target computer display from RK3588 HDMI RX.
-2. Mirror that display to RK3588 HDMI OUT.
-3. Provide browser-based remote viewing and USB HID keyboard/mouse control.
+2. Provide browser-based remote viewing and USB HID keyboard/mouse control.
 
 ## 2. Runtime Topology
 
@@ -19,14 +18,14 @@ The KVM has three jobs:
                   HDMI RX /dev/video40
                          |
                     GStreamer tee
-             /            |              \
-     KMS HDMI OUT    MPP H.264 encode    JPEG 2 FPS
-                         |               snapshot
-                    MPEG-TS/UDP             |
-                         |          /api/frame.jpg
-                      MediaMTX
-                         |
-                    WebRTC 1080p60
+                    /          \
+          MPP H.264 encode    JPEG 2 FPS
+                  |           snapshot
+               RTP/UDP          |
+                  |       /api/frame.jpg
+               MediaMTX
+                  |
+            WebRTC 1080p
                          |
                      Browser KVM page
                             |
@@ -51,36 +50,23 @@ The RK3588 board exposes HDMI RX as a V4L2 capture node:
 /dev/video40
 ```
 
-The verified capture format is:
+The KVM accepts BGR HDMI RX input and normalizes the browser stream to
+1920x1080. The source may be 1080p, 2K, or 4K.
 
 ```text
-video/x-raw,format=BGR,width=1920,height=1080,framerate=60/1
+video/x-raw,format=BGR
 ```
 
-The KVM requests this format in every primary pipeline.
+The video path reads the HDMI RX timing and sets `videorate drop-only=true`
+to the detected source rate. A 60 FPS input is forwarded at up to 60 FPS, while
+a 30 FPS input remains 30 FPS instead of being duplicated into artificial
+frames.
 
 ### HDMI OUT
 
-HDMI OUT is driven through GStreamer `kmssink`. The startup script stops
-`lightdm` before launching the KVM so that the KMS sink can own the display
-plane.
-
-The sink connector is selected automatically from `modetest -c`: the code picks
-the last connected `HDMI-A-*` connector. On the tested board this was connector
-`224`, corresponding to `HDMI-A-2`.
-
-The final mirror sink is intentionally forced to the rectangle that tested
-correctly on the monitor:
-
-```text
-kmssink sync=false fullscreen=true force-aspect-ratio=false
-force-modesetting=true render-rectangle="<0,0,1920,1080>"
-connector-id=<connected HDMI connector>
-```
-
-Although `kmssink` reports `display-width=1024` and `display-height=768` on this
-system, the forced render rectangle produced the correct visible aspect ratio
-during testing.
+HDMI OUT loop-out is deleted from this project. The service does not start
+`kmssink`, does not call `modetest`, does not stop `lightdm`, and does not take
+over the board desktop display. The KVM output is browser/WebRTC only.
 
 ### USB HID
 
@@ -114,11 +100,10 @@ coordinates `0..32767`.
 
 1. Requires root.
 2. Refuses to start if `/dev/video40`, `/dev/hidg0`, or `/dev/hidg1` is absent.
-3. Stops `lightdm` so HDMI OUT can be driven by KMS.
-4. Starts MediaMTX for WebRTC signaling and transport.
-5. Starts `stream_mpp.sh` as the only `/dev/video40` owner.
-6. Starts `rk3588_kvm.py` for the UI, HID and snapshot API.
-7. Writes separate PID and log files under `/tmp`.
+3. Starts MediaMTX for WebRTC signaling and transport.
+4. Starts `stream_mpp.sh` as the only `/dev/video40` owner.
+5. Starts `rk3588_kvm.py` for the UI, HID and snapshot API.
+6. Writes separate PID and log files under `/tmp`.
 
 `stream_watchdog.sh` supervises the GStreamer worker through MediaMTX's local
 path API. It checks both `ready=true` and an increasing `inboundBytes` counter.
@@ -127,9 +112,10 @@ gateway services untouched.
 
 `stop.sh` reads the PID file and terminates the KVM process.
 
-The KVM is not installed as an autostart service by default. This is deliberate:
-it is a manual test tool that should not interfere with the original gateway
-unless explicitly started.
+The repository includes `systemd/rk3588-kvm.service` for deployments that should
+start KVM on boot. The unit calls `/opt/rk3588_kvm/run.sh` and
+`/opt/rk3588_kvm/stop.sh`, and waits for the USB gadget service so `/dev/hidg0`
+and `/dev/hidg1` exist before the KVM starts.
 
 ## 5. Video Pipeline
 
@@ -137,14 +123,20 @@ The preferred GStreamer pipeline is:
 
 ```text
 v4l2src device=/dev/video40 io-mode=2 do-timestamp=true
-  ! video/x-raw,format=BGR,width=1920,height=1080,framerate=60/1
+  ! video/x-raw,format=BGR
   ! tee name=t
-    t. ! queue leaky=downstream max-size-buffers=2
-       ! mpph264enc bps=8000000 gop=30 profile=66 level=42
-         zero-copy-pkt=false
-       ! h264parse ! mpegtsmux ! udpsink port=5000
     t. ! queue leaky=downstream max-size-buffers=1
-       ! videorate max-rate=2 ! jpegenc
+       ! videorate drop-only=true max-rate=<detected source fps>
+       ! videoscale
+       ! video/x-raw,format=BGR,width=1920,height=1080,framerate=<fps>/1
+       ! mpph264enc bps=16000000 bps-min=16000000 bps-max=16000000
+         gop=15 profile=100 level=42 max-reenc=0 qos=true zero-copy-pkt=false
+       ! h264parse ! rtph264pay pt=96 aggregate-mode=zero-latency
+       ! udpsink port=5004
+    t. ! queue leaky=downstream max-size-buffers=1
+       ! videoconvert ! videoscale
+       ! video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1
+       ! videorate drop-only=true max-rate=2 ! jpegenc quality=90
        ! multifilesink location=/tmp/rk3588_kvm_latest.jpg
 ```
 
@@ -159,11 +151,11 @@ queue leaky=downstream      Drop old frames under pressure.
 max-size-buffers=1          Keep only one queued frame.
 appsink drop=true           Do not build a frame backlog.
 appsink max-buffers=1       Cache only the newest frame.
-sync=false                  Avoid display-clock buffering in this test mode.
+sync=false                  Avoid unnecessary buffering in this test mode.
 ```
 
-If the mirror pipeline fails, the code tries fallback capture pipelines without
-the mirror branch so the web KVM can still come up.
+The active MPP path no longer contains a KMS/HDMI OUT branch. This keeps the
+remote stream independent from the board desktop display.
 
 ## 6. Browser Stream
 
@@ -183,9 +175,9 @@ POST /api/key       Keyboard event
 The normal browser stream is served by MediaMTX:
 
 ```text
-H.264 baseline, level 4.2
-1920x1080 input at 60 FPS
-8 Mbps CBR target
+H.264 High, level 4.2
+1920x1080 output, source-matched frame rate
+16 Mbps CBR target
 WebRTC HTTP: 8889
 WebRTC ICE:  8189 UDP/TCP
 ```
@@ -236,6 +228,17 @@ Supported mouse event types:
 The mouse and keyboard file descriptors are kept open after first use. This
 avoids open/close overhead on every pointer movement and lowers input latency.
 
+Mouse movement uses a smooth latest-target policy:
+
+```text
+Browser/WebSocket side: keep only the newest move target.
+Board/HID side: split large absolute jumps into short 6 ms HID steps.
+Click/down/up/double-click: stay ordered and immediate.
+```
+
+This preserves low latency while preventing the remote Windows cursor from
+visibly jumping during large movements.
+
 ## 9. Status API
 
 Example:
@@ -253,7 +256,8 @@ Example:
   "keyboard": "/dev/hidg0",
   "keyboard_exists": true,
   "mouse": "/dev/hidg1",
-  "mouse_exists": true
+  "mouse_exists": true,
+  "mouse_queue_mode": "smooth-latest-target"
 }
 ```
 
@@ -295,12 +299,6 @@ Check devices:
 ls -l /dev/video40 /dev/hidg0 /dev/hidg1
 ```
 
-Check HDMI connectors:
-
-```bash
-modetest -c | grep -E "HDMI-A|connected"
-```
-
 Check status:
 
 ```bash
@@ -320,19 +318,12 @@ Check logs:
 tail -120 /tmp/rk3588_kvm.log
 ```
 
-Restore the Debian desktop:
-
-```bash
-sudo /opt/rk3588_kvm/stop.sh
-sudo systemctl start lightdm
-```
-
 ## 12. Known Limits
 
-- This is not hardware HDMI pass-through. It is capture, render, and HID control
-  in software, so some latency is expected.
-- The browser stream is downscaled by default to reduce CPU and network load.
-- HDMI OUT aspect ratio depends on the tested KMS render rectangle. The current
-  stable setting is the forced 1920x1080 rectangle.
+- This is not hardware HDMI pass-through. It is capture, encode, network
+  transport, and HID control in software, so some latency is expected.
+- The browser stream is normalized to 1920x1080 to reduce load and keep mouse
+  coordinates stable.
+- HDMI OUT loop-out is not part of the project.
 - Only one process should own `/dev/video40`.
-- The script is manual-start only and does not create a systemd autostart unit.
+- The included systemd unit assumes the runtime directory is `/opt/rk3588_kvm`.

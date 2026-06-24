@@ -6,8 +6,8 @@ import base64
 import errno
 import hashlib
 import json
+import math
 import os
-import re
 import socket
 import struct
 import subprocess
@@ -25,11 +25,14 @@ import numpy as np
 
 SCREEN_W = 1920
 SCREEN_H = 1080
-KEY_HOLD_SECONDS = 0.025
-KEY_RELEASE_SECONDS = 0.025
+KEY_HOLD_SECONDS = 0.008
+KEY_RELEASE_SECONDS = 0.006
 MOUSE_SETTLE_SECONDS = 0.0
-MOUSE_DOUBLE_CLICK_DOWN_SECONDS = 0.05
-MOUSE_DOUBLE_CLICK_UP_SECONDS = 0.08
+MOUSE_DOUBLE_CLICK_DOWN_SECONDS = 0.035
+MOUSE_DOUBLE_CLICK_UP_SECONDS = 0.045
+MOUSE_SMOOTH_INTERVAL_SECONDS = 0.006
+MOUSE_SMOOTH_DIRECT_DISTANCE = 48.0
+MOUSE_SMOOTH_MAX_STEP = 180.0
 MOUSE_WS_PACKET_SIZE = 6
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MOUSE_EVENT_MOVE = 0
@@ -126,6 +129,17 @@ CODE_TO_USAGE = {
     "ArrowUp": 0x52,
 }
 
+MOD_CODE_TO_BIT = {
+    "ControlLeft": 0x01,
+    "ShiftLeft": 0x02,
+    "AltLeft": 0x04,
+    "MetaLeft": 0x08,
+    "ControlRight": 0x10,
+    "ShiftRight": 0x20,
+    "AltRight": 0x40,
+    "MetaRight": 0x80,
+}
+
 for i, ch in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
     CODE_TO_USAGE[f"Key{ch}"] = 0x04 + i
 for i in range(10):
@@ -142,12 +156,43 @@ def clamp_int(value: Any, low: int, high: int) -> int:
 
 def html_page(width: int, height: int, webrtc: bool = False) -> bytes:
     media = (
-        '<iframe id="video" class="video-layer" allow="autoplay; fullscreen" scrolling="no"></iframe>'
+        '<video id="video" class="video-layer" autoplay muted playsinline disablepictureinpicture></video>'
         if webrtc
         else '<img id="video" class="video-layer" src="/stream.mjpg" draggable="false" />'
     )
     webrtc_setup = (
-        'document.getElementById("video").src = "http://" + location.hostname + ":8889/kvm?autoplay=true&muted=true&controls=false";'
+        """
+const video = document.getElementById("video");
+let currentWebRTCStream = null;
+video.addEventListener("playing", () => {
+  video.classList.add("is-playing");
+});
+
+function startLowLatencyWebRTC() {
+  const base = "http://" + location.hostname + ":8889/kvm/";
+  const script = document.createElement("script");
+  script.src = base + "reader.js";
+  script.onload = () => {
+    webrtcReader = new MediaMTXWebRTCReader({
+      url: base + "whep",
+      onError: err => { state.textContent = "WebRTC: " + err; },
+      onTrack: ev => {
+        try { ev.receiver.playoutDelayHint = 0; } catch (e) {}
+        try { ev.receiver.jitterBufferTarget = 0; } catch (e) {}
+        const stream = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
+        if (currentWebRTCStream !== stream) {
+          currentWebRTCStream = stream;
+          video.srcObject = stream;
+        }
+        video.play().catch(err => { state.textContent = "video play: " + err; });
+      },
+      onDataChannel: () => {}
+    });
+  };
+  script.onerror = () => { state.textContent = "failed to load WebRTC reader"; };
+  document.head.appendChild(script);
+}
+"""
         if webrtc
         else ""
     )
@@ -158,31 +203,23 @@ def html_page(width: int, height: int, webrtc: bool = False) -> bytes:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RK3588 KVM</title>
 <style>
-html, body {{ margin: 0; height: 100%; background: #111827; color: #e5e7eb; font-family: Arial, sans-serif; }}
-#top {{ height: 42px; display: flex; align-items: center; gap: 16px; padding: 0 14px; background: #0f172a; }}
-#stage {{ height: calc(100% - 42px); display: flex; align-items: center; justify-content: center; overflow: hidden; }}
-#viewport {{ position: relative; width: min(100%, calc((100vh - 42px) * 16 / 9)); aspect-ratio: 16 / 9; }}
+html, body {{ margin: 0; height: 100%; background: #000; color: #e5e7eb; font-family: Arial, sans-serif; overflow: hidden; overscroll-behavior: none; }}
+#stage {{ height: 100%; display: flex; align-items: center; justify-content: center; overflow: hidden; }}
+#viewport {{ position: relative; width: min(100vw, calc(100vh * 16 / 9)); aspect-ratio: 16 / 9; background: #000; overflow: hidden; }}
 .video-layer, #screen {{ position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }}
-.video-layer {{ object-fit: contain; pointer-events: none; background: #000; }}
-#screen {{ outline: none; user-select: none; cursor: crosshair; z-index: 2; }}
-#cursor {{ position: absolute; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.95); border-radius: 999px; box-shadow: 0 0 0 1px rgba(15,23,42,0.7); pointer-events: none; z-index: 3; transform: translate(-50%, -50%) scale(1); opacity: 0; transition: opacity 120ms linear, transform 90ms ease-out; }}
-#cursor.active {{ opacity: 1; }}
-#cursor.clicking {{ transform: translate(-50%, -50%) scale(0.86); }}
-button {{ background: #2563eb; color: white; border: 0; border-radius: 4px; padding: 7px 10px; }}
-#state {{ color: #9ca3af; font-size: 13px; }}
+.video-layer {{ object-fit: contain; pointer-events: none; background: #000; transform: translateZ(0); backface-visibility: hidden; }}
+video.video-layer {{ opacity: 0; }}
+video.video-layer.is-playing {{ opacity: 1; }}
+#screen {{ outline: none; user-select: none; -webkit-user-select: none; touch-action: none; cursor: default; z-index: 2; }}
+#state {{ display: none; }}
 </style>
 </head>
 <body>
-<div id="top">
-  <strong>RK3588 KVM</strong>
-  <button id="focus">Focus Keyboard</button>
-  <span id="state">video {width}x{height}, click image then type</span>
-</div>
+<span id="state">video {width}x{height}, click image then type</span>
 <div id="stage">
   <div id="viewport">
     {media}
     <div id="screen" tabindex="0"></div>
-    <div id="cursor"></div>
   </div>
 </div>
 <script>
@@ -192,16 +229,15 @@ const EVT_MOVE = {MOUSE_EVENT_MOVE};
 const EVT_DOWN = {MOUSE_EVENT_DOWN};
 const EVT_UP = {MOUSE_EVENT_UP};
 const EVT_DBLCLICK = {MOUSE_EVENT_DBLCLICK};
+let webrtcReader = null;
 {webrtc_setup}
 const img = document.getElementById("screen");
 const state = document.getElementById("state");
-const cursor = document.getElementById("cursor");
 let mouseSocket = null;
 let mouseSocketTimer = null;
+let heartbeatTimer = null;
 let pendingMove = null;
-let moveDrainQueued = false;
-let predictedCursor = null;
-let clickPulseTimer = null;
+let moveTimer = null;
 
 function coords(ev) {{
   const r = img.getBoundingClientRect();
@@ -211,43 +247,8 @@ function coords(ev) {{
   }};
 }}
 
-function viewportPosition(ev) {{
-  const r = img.getBoundingClientRect();
-  return {{
-    left: Math.max(0, Math.min(r.width, ev.clientX - r.left)),
-    top: Math.max(0, Math.min(r.height, ev.clientY - r.top))
-  }};
-}}
-
-function viewportPositionFromCoords(x, y) {{
-  const r = img.getBoundingClientRect();
-  return {{
-    left: Math.max(0, Math.min(r.width, x * r.width / Math.max(W - 1, 1))),
-    top: Math.max(0, Math.min(r.height, y * r.height / Math.max(H - 1, 1)))
-  }};
-}}
-
-function paintCursorAt(x, y) {{
-  const pos = viewportPositionFromCoords(x, y);
-  cursor.style.left = pos.left + "px";
-  cursor.style.top = pos.top + "px";
-  cursor.classList.add("active");
-}}
-
 function updateCursor(ev) {{
-  const c = coords(ev);
-  predictedCursor = c;
-  paintCursorAt(c.x, c.y);
-  return c;
-}}
-
-function pulseCursor() {{
-  cursor.classList.add("clicking");
-  if (clickPulseTimer) window.clearTimeout(clickPulseTimer);
-  clickPulseTimer = window.setTimeout(() => {{
-    cursor.classList.remove("clicking");
-    clickPulseTimer = null;
-  }}, 90);
+  return coords(ev);
 }}
 
 async function post(path, payload) {{
@@ -290,13 +291,23 @@ function scheduleMouseSocketReconnect(delayMs = 1000) {{
   }}, delayMs);
 }}
 
+function startHeartbeat() {{
+  if (heartbeatTimer) return;
+  heartbeatTimer = window.setInterval(() => {{
+    if (mouseSocket && mouseSocket.readyState === WebSocket.OPEN && mouseSocket.bufferedAmount < 1024) {{
+      mouseSocket.send('{{"type":"ping"}}');
+    }}
+  }}, 15000);
+}}
+
 function ensureMouseSocket() {{
   if (mouseSocket && (mouseSocket.readyState === WebSocket.OPEN || mouseSocket.readyState === WebSocket.CONNECTING)) return;
   const scheme = location.protocol === "https:" ? "wss://" : "ws://";
   mouseSocket = new WebSocket(scheme + location.host + "/ws/input");
   mouseSocket.binaryType = "arraybuffer";
   mouseSocket.onopen = () => {{
-    state.textContent = "video {width}x{height}, websocket latest-only input ready";
+    state.textContent = "video {width}x{height}, websocket smooth input ready";
+    startHeartbeat();
   }};
   mouseSocket.onclose = () => {{
     state.textContent = "input reconnecting...";
@@ -310,39 +321,54 @@ function ensureMouseSocket() {{
 }}
 
 function sendMouse(type, button, x, y) {{
-  predictedCursor = {{ x, y }};
-  paintCursorAt(x, y);
-  if (type !== EVT_MOVE) pulseCursor();
   const packet = mousePacket(type, button, x, y);
   if (mouseSocket && mouseSocket.readyState === WebSocket.OPEN) {{
-    if (type === EVT_MOVE && mouseSocket.bufferedAmount > 1024) return;
+    if (type === EVT_MOVE && mouseSocket.bufferedAmount > 0) return;
     mouseSocket.send(packet);
     return;
   }}
   mouseFallback(type, button, x, y);
 }}
 
-function queueMoveSend() {{
-  if (moveDrainQueued) return;
-  moveDrainQueued = true;
-  requestAnimationFrame(() => {{
-    moveDrainQueued = false;
-    if (!pendingMove) return;
-    const move = pendingMove;
-    pendingMove = null;
-    sendMouse(EVT_MOVE, move.buttons, move.x, move.y);
-  }});
+function sendKey(payload) {{
+  if (mouseSocket && mouseSocket.readyState === WebSocket.OPEN && mouseSocket.bufferedAmount < 4096) {{
+    mouseSocket.send(JSON.stringify({{ type: "key", ...payload }}));
+    return;
+  }}
+  post("/api/key", payload);
 }}
 
-img.addEventListener("pointermove", ev => {{
+function drainMouseMove() {{
+  moveTimer = null;
+  if (!pendingMove) return;
+  if (mouseSocket && mouseSocket.readyState === WebSocket.OPEN && mouseSocket.bufferedAmount > 0) {{
+    moveTimer = window.setTimeout(drainMouseMove, 2);
+    return;
+  }}
+  const move = pendingMove;
+  pendingMove = null;
+  sendMouse(EVT_MOVE, move.buttons, move.x, move.y);
+  if (pendingMove) queueMoveSend();
+}}
+
+function queueMoveSend() {{
+  if (moveTimer !== null) return;
+  moveTimer = window.setTimeout(drainMouseMove, 0);
+}}
+
+function handlePointerMove(ev) {{
   const c = updateCursor(ev);
   pendingMove = {{ ...c, buttons: ev.buttons }};
   queueMoveSend();
-}});
+}}
+
+const moveEventName = ("onpointerrawupdate" in window) ? "pointerrawupdate" : "pointermove";
+img.addEventListener(moveEventName, handlePointerMove, {{ passive: true }});
 
 img.addEventListener("pointerdown", ev => {{
   img.focus();
   ev.preventDefault();
+  pendingMove = null;
   const c = updateCursor(ev);
   try {{ img.setPointerCapture(ev.pointerId); }} catch (e) {{}}
   sendMouse(EVT_DOWN, ev.button, c.x, c.y);
@@ -350,6 +376,7 @@ img.addEventListener("pointerdown", ev => {{
 
 img.addEventListener("pointerup", ev => {{
   ev.preventDefault();
+  pendingMove = null;
   const c = updateCursor(ev);
   try {{ img.releasePointerCapture(ev.pointerId); }} catch (e) {{}}
   sendMouse(EVT_UP, ev.button, c.x, c.y);
@@ -362,16 +389,11 @@ img.addEventListener("dblclick", ev => {{
 }});
 
 img.addEventListener("contextmenu", ev => ev.preventDefault());
-img.addEventListener("pointerleave", () => {{
-  if (!predictedCursor) cursor.classList.remove("active");
-}});
-window.addEventListener("blur", () => cursor.classList.remove("active"));
-
 window.addEventListener("keydown", ev => {{
   if (document.activeElement !== img) return;
-  if (ev.repeat) return;
   ev.preventDefault();
-  post("/api/key", {{
+  sendKey({{
+    action: "down",
     key: ev.key,
     code: ev.code,
     ctrl: ev.ctrlKey,
@@ -381,9 +403,32 @@ window.addEventListener("keydown", ev => {{
   }});
 }});
 
-document.getElementById("focus").onclick = () => img.focus();
+window.addEventListener("keyup", ev => {{
+  if (document.activeElement !== img) return;
+  ev.preventDefault();
+  sendKey({{
+    action: "up",
+    key: ev.key,
+    code: ev.code,
+    ctrl: ev.ctrlKey,
+    alt: ev.altKey,
+    shift: ev.shiftKey,
+    meta: ev.metaKey
+  }});
+}});
+
+window.addEventListener("blur", () => {{
+  sendKey({{ action: "reset" }});
+}});
+window.addEventListener("beforeunload", () => sendKey({{ action: "reset" }}));
+
 ensureMouseSocket();
+{("startLowLatencyWebRTC();" if webrtc else "")}
 img.focus();
+
+window.addEventListener("beforeunload", () => {{
+  if (webrtcReader) webrtcReader.close();
+}});
 </script>
 </body>
 </html>
@@ -462,61 +507,14 @@ class FrameGrabber:
             self._frame_count += 1
 
     def _pipelines(self) -> list[str]:
-        caps = f"video/x-raw,format=BGR,width={self.width},height={self.height},framerate=60/1"
+        caps = f"video/x-raw,format=BGR,width={self.width},height={self.height}"
         sink = "appsink drop=true max-buffers=1 sync=false"
         queue = "queue leaky=downstream max-size-buffers=1 max-size-time=0 max-size-bytes=0"
-        mirror_sink = self._mirror_sink()
-        mirror_caps = f"video/x-raw,width={self.width},height={self.height},pixel-aspect-ratio=1/1"
-        mirror = f"{queue} ! videoconvert ! videoscale ! {mirror_caps} ! {mirror_sink}"
         return [
-            f"v4l2src device={self.device} io-mode=4 do-timestamp=true ! {caps} ! tee name=t "
-            f"t. ! {mirror} t. ! {queue} ! {sink}",
-            f"v4l2src device={self.device} do-timestamp=true ! {caps} ! tee name=t "
-            f"t. ! {mirror} t. ! {queue} ! {sink}",
             f"v4l2src device={self.device} io-mode=4 do-timestamp=true ! {caps} ! {queue} ! {sink}",
             f"v4l2src device={self.device} do-timestamp=true ! {caps} ! {queue} ! {sink}",
             f"v4l2src device={self.device} ! {caps} ! videoconvert ! {queue} ! {sink}",
         ]
-
-    def _mirror_sink(self) -> str:
-        connector_id = self._find_hdmi_connector_id()
-        base = (
-            "kmssink sync=false fullscreen=true force-aspect-ratio=false "
-            "force-modesetting=true render-rectangle=\"<0,0,1920,1080>\""
-        )
-        if connector_id is not None:
-            return f"{base} connector-id={connector_id}"
-        return base
-
-    @staticmethod
-    def _find_hdmi_connector_id() -> Optional[int]:
-        try:
-            result = subprocess.run(
-                ["modetest", "-c"],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=2,
-            )
-        except Exception:
-            return None
-        connected: list[int] = []
-        fallback: list[int] = []
-        for line in result.stdout.splitlines():
-            match = re.match(r"^\s*(\d+)\s+\d+\s+(\w+)\s+(HDMI-A-\d+)\s+", line)
-            if not match:
-                continue
-            connector_id = int(match.group(1))
-            status = match.group(2)
-            fallback.append(connector_id)
-            if status == "connected":
-                connected.append(connector_id)
-        if connected:
-            return connected[-1]
-        if fallback:
-            return fallback[-1]
-        return None
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -570,7 +568,7 @@ class FrameGrabber:
                 f"device={self.device}",
                 "num-buffers=1",
                 "!",
-                f"video/x-raw,format=BGR,width={self.width},height={self.height},framerate=60/1",
+                f"video/x-raw,format=BGR,width={self.width},height={self.height}",
                 "!",
                 "videoconvert",
                 "!",
@@ -667,6 +665,7 @@ class MouseInputDispatcher:
         self._condition = threading.Condition()
         self._actions: deque[tuple[int, int, int, int]] = deque()
         self._latest_move: Optional[tuple[int, int, int, int]] = None
+        self._last_mouse: Optional[tuple[int, int, int]] = None
         self._stop = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -684,6 +683,7 @@ class MouseInputDispatcher:
 
     def queue_action(self, event_type: int, button: int, x: int, y: int) -> None:
         with self._condition:
+            self._latest_move = None
             self._actions.append((event_type, button & 0x07, x, y))
             self._condition.notify()
 
@@ -695,10 +695,15 @@ class MouseInputDispatcher:
                 "buttons": self._latest_move[1],
             }
             return {
-                "mouse_queue_mode": "latest-only-move",
+                "mouse_queue_mode": "smooth-latest-target",
                 "mouse_action_backlog": len(self._actions),
                 "mouse_has_pending_move": self._latest_move is not None,
                 "mouse_latest_move": latest_move,
+                "mouse_last_position": None if self._last_mouse is None else {
+                    "buttons": self._last_mouse[0],
+                    "x": self._last_mouse[1],
+                    "y": self._last_mouse[2],
+                },
             }
 
     def enqueue_packet(self, payload: bytes) -> bool:
@@ -732,6 +737,8 @@ class MouseInputDispatcher:
 
     def _loop(self) -> None:
         while True:
+            event: tuple[int, int, int, int] | None = None
+            smooth_wait = False
             with self._condition:
                 while not self._stop and not self._actions and self._latest_move is None:
                     self._condition.wait(timeout=0.5)
@@ -739,15 +746,59 @@ class MouseInputDispatcher:
                     return
                 if self._actions:
                     event = self._actions.popleft()
+                    self._record_action_position_locked(*event)
                 else:
-                    event = self._latest_move
-                    self._latest_move = None
+                    event = self._next_smooth_move_locked()
+                    smooth_wait = self._latest_move is not None
             if event is not None:
                 try:
                     self._dispatch(*event)
                 except OSError as exc:
                     print(f"mouse dispatch error: {exc}", flush=True)
                     time.sleep(0.02)
+            if smooth_wait:
+                time.sleep(MOUSE_SMOOTH_INTERVAL_SECONDS)
+
+    def _record_action_position_locked(self, event_type: int, button: int, x: int, y: int) -> None:
+        if event_type == MOUSE_EVENT_DOWN:
+            self._last_mouse = (button & 0x07, x, y)
+        elif event_type == MOUSE_EVENT_UP:
+            self._last_mouse = (0, x, y)
+        elif event_type == MOUSE_EVENT_DBLCLICK:
+            self._last_mouse = (0, x, y)
+
+    def _next_smooth_move_locked(self) -> tuple[int, int, int, int] | None:
+        if self._latest_move is None:
+            return None
+        _, buttons, target_x, target_y = self._latest_move
+        buttons &= 0x07
+
+        if self._last_mouse is None:
+            self._last_mouse = (buttons, target_x, target_y)
+            self._latest_move = None
+            return (MOUSE_EVENT_MOVE, buttons, target_x, target_y)
+
+        _, last_x, last_y = self._last_mouse
+        dx = target_x - last_x
+        dy = target_y - last_y
+        distance = math.hypot(dx, dy)
+        if distance <= MOUSE_SMOOTH_DIRECT_DISTANCE:
+            next_x = target_x
+            next_y = target_y
+            self._latest_move = None
+        else:
+            scale = min(1.0, MOUSE_SMOOTH_MAX_STEP / distance)
+            next_x = clamp_int(round(last_x + dx * scale), 0, self.hid.width - 1)
+            next_y = clamp_int(round(last_y + dy * scale), 0, self.hid.height - 1)
+            if next_x == last_x and target_x != last_x:
+                next_x += 1 if target_x > last_x else -1
+            if next_y == last_y and target_y != last_y:
+                next_y += 1 if target_y > last_y else -1
+            next_x = clamp_int(next_x, 0, self.hid.width - 1)
+            next_y = clamp_int(next_y, 0, self.hid.height - 1)
+            self._latest_move = (MOUSE_EVENT_MOVE, buttons, target_x, target_y)
+        self._last_mouse = (buttons, next_x, next_y)
+        return (MOUSE_EVENT_MOVE, buttons, next_x, next_y)
 
     def _dispatch(self, event_type: int, button: int, x: int, y: int) -> None:
         if event_type == MOUSE_EVENT_DOWN:
@@ -790,6 +841,8 @@ class HidDevices:
         self._mouse_lock = threading.Lock()
         self._keyboard_fd: Optional[int] = None
         self._mouse_fd: Optional[int] = None
+        self._pressed_modifiers: dict[str, int] = {}
+        self._pressed_usages: dict[str, int] = {}
 
     def status(self) -> dict[str, Any]:
         return {
@@ -801,6 +854,7 @@ class HidDevices:
 
     def close(self) -> None:
         with self._keyboard_lock:
+            self._release_all_keys_locked()
             self._close_keyboard_locked()
         with self._mouse_lock:
             self._close_mouse_locked()
@@ -833,15 +887,11 @@ class HidDevices:
         with self._keyboard_lock:
             self._write_with_retry(self._keyboard_fd_locked, self._close_keyboard_locked, report)
 
-    def press_key(self, mod: int, code: int) -> None:
-        self._write_keyboard(bytes([mod & 0xFF, 0, code & 0xFF, 0, 0, 0, 0, 0]))
-        time.sleep(KEY_HOLD_SECONDS)
-        self._write_keyboard(bytes(8))
-        time.sleep(KEY_RELEASE_SECONDS)
+    def _write_keyboard_locked(self, report: bytes) -> None:
+        self._write_with_retry(self._keyboard_fd_locked, self._close_keyboard_locked, report)
 
-    def key_event(self, payload: dict[str, Any]) -> bool:
-        key = str(payload.get("key") or "")
-        code_name = str(payload.get("code") or "")
+    @staticmethod
+    def _payload_modifiers(payload: dict[str, Any]) -> int:
         mod = 0
         if payload.get("ctrl"):
             mod |= 0x01
@@ -851,6 +901,58 @@ class HidDevices:
             mod |= 0x04
         if payload.get("meta"):
             mod |= 0x08
+        return mod
+
+    @staticmethod
+    def _key_id(payload: dict[str, Any]) -> str:
+        code_name = str(payload.get("code") or "")
+        key = str(payload.get("key") or "")
+        return code_name or key
+
+    @staticmethod
+    def _usage_from_payload(payload: dict[str, Any]) -> tuple[int, int]:
+        code_name = str(payload.get("code") or "")
+        key = str(payload.get("key") or "")
+        usage = CODE_TO_USAGE.get(code_name)
+        if usage is not None:
+            return 0, usage
+        if len(key) == 1:
+            return KEY.get(key, (0, 0))
+        return 0, 0
+
+    def _keyboard_report(self, extra_mod: int = 0) -> bytes:
+        mod = extra_mod
+        for value in self._pressed_modifiers.values():
+            mod |= value
+        usages = list(dict.fromkeys(self._pressed_usages.values()))[:6]
+        usages.extend([0] * (6 - len(usages)))
+        return bytes([mod & 0xFF, 0, *[usage & 0xFF for usage in usages]])
+
+    def _send_keyboard_state_locked(self, extra_mod: int = 0) -> None:
+        self._write_keyboard_locked(self._keyboard_report(extra_mod))
+
+    def _release_all_keys_locked(self) -> None:
+        self._pressed_modifiers.clear()
+        self._pressed_usages.clear()
+        try:
+            self._write_keyboard_locked(bytes(8))
+        except OSError:
+            pass
+
+    def press_key(self, mod: int, code: int) -> None:
+        self._write_keyboard(bytes([mod & 0xFF, 0, code & 0xFF, 0, 0, 0, 0, 0]))
+        time.sleep(KEY_HOLD_SECONDS)
+        self._write_keyboard(bytes(8))
+        time.sleep(KEY_RELEASE_SECONDS)
+
+    def key_event(self, payload: dict[str, Any]) -> bool:
+        action = str(payload.get("action") or "press")
+        if action in ("down", "up", "reset"):
+            return self.key_state_event(payload, action)
+
+        key = str(payload.get("key") or "")
+        code_name = str(payload.get("code") or "")
+        mod = self._payload_modifiers(payload)
 
         if len(key) == 1 and not (payload.get("ctrl") or payload.get("alt") or payload.get("meta")):
             key_mod, usage = KEY.get(key, (0, 0))
@@ -864,6 +966,36 @@ class HidDevices:
             return False
         self.press_key(mod, usage)
         return True
+
+    def key_state_event(self, payload: dict[str, Any], action: str) -> bool:
+        key_id = self._key_id(payload)
+        if action == "reset":
+            with self._keyboard_lock:
+                self._release_all_keys_locked()
+            return True
+        if not key_id:
+            return False
+
+        with self._keyboard_lock:
+            mod_bit = MOD_CODE_TO_BIT.get(key_id)
+            if mod_bit is not None:
+                if action == "down":
+                    self._pressed_modifiers[key_id] = mod_bit
+                else:
+                    self._pressed_modifiers.pop(key_id, None)
+                self._send_keyboard_state_locked()
+                return True
+
+            key_mod, usage = self._usage_from_payload(payload)
+            if not usage:
+                return False
+            if action == "down":
+                self._pressed_usages[key_id] = usage
+                self._send_keyboard_state_locked(self._payload_modifiers(payload) | key_mod)
+            else:
+                self._pressed_usages.pop(key_id, None)
+                self._send_keyboard_state_locked(self._payload_modifiers(payload) & ~key_mod)
+            return True
 
     @staticmethod
     def _scale(value: int, size: int) -> int:
@@ -892,7 +1024,7 @@ class HidDevices:
         close_fd: Any,
         report: bytes,
         retries: int = 4,
-        delay_seconds: float = 0.01,
+        delay_seconds: float = 0.002,
     ) -> None:
         last_error: OSError | None = None
         for _ in range(retries):
@@ -1106,7 +1238,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         try:
-            self.connection.settimeout(30.0)
+            self.connection.settimeout(300.0)
             while True:
                 opcode, payload = self._ws_read_frame()
                 if opcode is None:
@@ -1117,6 +1249,11 @@ class Handler(BaseHTTPRequestHandler):
                 if opcode == 0x9:
                     self._ws_send_frame(0xA, payload)
                     continue
+                if opcode == 0x1:
+                    if not self._handle_input_text_frame(payload):
+                        self._ws_send_frame(0x8, b"")
+                        return
+                    continue
                 if opcode != 0x2:
                     continue
                 if not self.state.mouse_input.enqueue_packet(payload):
@@ -1124,6 +1261,22 @@ class Handler(BaseHTTPRequestHandler):
                     return
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             return
+
+    def _handle_input_text_frame(self, payload: bytes) -> bool:
+        if len(payload) > 4096:
+            return False
+        try:
+            message = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(message, dict):
+            return False
+        if message.get("type") == "ping":
+            return True
+        if message.get("type") == "key":
+            self.state.hid.key_event(message)
+            return True
+        return False
 
     def _ws_read_frame(self) -> tuple[int | None, bytes]:
         header = self.rfile.read(2)
