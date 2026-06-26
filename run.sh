@@ -9,7 +9,6 @@ STREAM_PID_FILE="${STREAM_PID_FILE:-/tmp/rk3588_kvm_stream.pid}"
 STREAM_LOG_FILE="${STREAM_LOG_FILE:-/tmp/rk3588_kvm_stream.log}"
 MEDIAMTX_PID_FILE="${MEDIAMTX_PID_FILE:-/tmp/rk3588_kvm_mediamtx.pid}"
 MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/tmp/rk3588_kvm_mediamtx.log}"
-FRAME_FILE="${FRAME_FILE:-/tmp/rk3588_kvm_latest.jpg}"
 KVM_WIDTH="${KVM_WIDTH:-1920}"
 KVM_HEIGHT="${KVM_HEIGHT:-1080}"
 
@@ -48,7 +47,7 @@ if [[ -x /usr/local/bin/mediamtx && "${KVM_LEGACY_MJPEG:-0}" != "1" ]]; then
   : >"$STREAM_LOG_FILE"
   nohup "$ROOT/stream_watchdog.sh" >>"$STREAM_LOG_FILE" 2>&1 &
   echo "$!" > "$STREAM_PID_FILE"
-  KVM_ARGS+=(--frame-file "$FRAME_FILE" --webrtc)
+  KVM_ARGS+=(--external-stream --webrtc)
   echo "Hardware H.264 WebRTC enabled"
 else
   echo "MediaMTX unavailable; using legacy MJPEG mode"

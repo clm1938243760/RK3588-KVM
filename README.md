@@ -21,7 +21,7 @@ Keyboard HID node:  /dev/hidg0
 Mouse HID node:     /dev/hidg1
 Web port:           8090
 Input signal:       HDMI RX source timing, commonly 1920x1080@30/60
-Browser stream:     1920x1080 H.264 High WebRTC, source-matched FPS, 16 Mbps
+Browser stream:     1920x1080 H.264 High WebRTC, source-matched FPS, 12/24 Mbps VBR
 Mouse input path:   Persistent WebSocket, smooth latest-target queue
 ```
 
@@ -29,7 +29,7 @@ Mouse input path:   Persistent WebSocket, smooth latest-target queue
 
 ```text
 rk3588_kvm.py   Main KVM server
-stream_mpp.sh   HDMI RX, MPP H.264 and snapshot pipeline
+stream_mpp.sh   HDMI RX and MPP H.264 pipeline
 stream_watchdog.sh  Restarts the encoder if MediaMTX input bytes stop growing
 mediamtx.yml    WebRTC gateway configuration
 install_mediamtx.sh  MediaMTX ARM64 installer
@@ -54,6 +54,8 @@ http://192.168.20.224:8090
 ```
 
 Click the video once before typing so the web page receives keyboard focus.
+Use the top-right `Fit / 1:1` control to switch between fitting the browser and
+physical-pixel 1:1 display. The page remembers the selected mode.
 
 ## Stop
 
@@ -76,10 +78,10 @@ http://192.168.20.224:8889/kvm
 Useful fields:
 
 ```text
-frame_age       Freshness of the latest HDMI frame
-capture_fps     Effective rate in legacy MJPEG mode
-frame_bytes     Current full-resolution vision snapshot size
-active_pipeline Current GStreamer pipeline
+frame_age       Null in external H.264 mode
+capture_fps     Null in external H.264 mode
+frame_bytes     Zero in external H.264 mode
+active_pipeline Current external stream mode
 keyboard_exists Whether /dev/hidg0 exists
 mouse_exists    Whether /dev/hidg1 exists
 mouse_queue_mode Current mouse dispatch policy

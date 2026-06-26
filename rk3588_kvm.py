@@ -164,37 +164,71 @@ def html_page(width: int, height: int, webrtc: bool = False) -> bytes:
         """
 const video = document.getElementById("video");
 let currentWebRTCStream = null;
+let readerScriptLoading = false;
+let smoothVideoRequested = false;
 video.addEventListener("playing", () => {
   video.classList.add("is-playing");
 });
 
+function connectLowLatencyWebRTC() {
+  if (!smoothVideoRequested || webrtcReader || typeof MediaMTXWebRTCReader !== "function") return;
+  const base = "http://" + location.hostname + ":8889/kvm/";
+  webrtcReader = new MediaMTXWebRTCReader({
+    url: base + "whep",
+    onError: err => { state.textContent = "WebRTC: " + err; },
+    onTrack: ev => {
+      try { ev.receiver.playoutDelayHint = 0; } catch (e) {}
+      try { ev.receiver.jitterBufferTarget = 0; } catch (e) {}
+      const stream = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
+      if (currentWebRTCStream !== stream) {
+        currentWebRTCStream = stream;
+        video.srcObject = stream;
+      }
+      video.play().catch(err => { state.textContent = "video play: " + err; });
+    },
+    onDataChannel: () => {}
+  });
+}
+
 function startLowLatencyWebRTC() {
+  smoothVideoRequested = true;
+  if (webrtcReader) return;
+  if (typeof MediaMTXWebRTCReader === "function") {
+    connectLowLatencyWebRTC();
+    return;
+  }
+  if (readerScriptLoading) return;
+  readerScriptLoading = true;
   const base = "http://" + location.hostname + ":8889/kvm/";
   const script = document.createElement("script");
   script.src = base + "reader.js";
   script.onload = () => {
-    webrtcReader = new MediaMTXWebRTCReader({
-      url: base + "whep",
-      onError: err => { state.textContent = "WebRTC: " + err; },
-      onTrack: ev => {
-        try { ev.receiver.playoutDelayHint = 0; } catch (e) {}
-        try { ev.receiver.jitterBufferTarget = 0; } catch (e) {}
-        const stream = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
-        if (currentWebRTCStream !== stream) {
-          currentWebRTCStream = stream;
-          video.srcObject = stream;
-        }
-        video.play().catch(err => { state.textContent = "video play: " + err; });
-      },
-      onDataChannel: () => {}
-    });
+    readerScriptLoading = false;
+    connectLowLatencyWebRTC();
   };
-  script.onerror = () => { state.textContent = "failed to load WebRTC reader"; };
+  script.onerror = () => {
+    readerScriptLoading = false;
+    state.textContent = "failed to load WebRTC reader";
+  };
   document.head.appendChild(script);
+}
+
+function stopLowLatencyWebRTC() {
+  smoothVideoRequested = false;
+  if (webrtcReader) webrtcReader.close();
+  webrtcReader = null;
+  currentWebRTCStream = null;
+  video.pause();
+  video.srcObject = null;
+  video.classList.remove("is-playing");
 }
 """
         if webrtc
-        else ""
+        else """
+const video = document.getElementById("video");
+function startLowLatencyWebRTC() {}
+function stopLowLatencyWebRTC() {}
+"""
     )
     body = f"""<!doctype html>
 <html>
@@ -206,17 +240,31 @@ function startLowLatencyWebRTC() {
 html, body {{ margin: 0; height: 100%; background: #000; color: #e5e7eb; font-family: Arial, sans-serif; overflow: hidden; overscroll-behavior: none; }}
 #stage {{ height: 100%; display: flex; align-items: center; justify-content: center; overflow: hidden; }}
 #viewport {{ position: relative; width: min(100vw, calc(100vh * 16 / 9)); aspect-ratio: 16 / 9; background: #000; overflow: hidden; }}
+#stage.native {{ overflow: auto; }}
+#stage.native #viewport {{ flex: 0 0 auto; width: var(--native-width); height: var(--native-height); aspect-ratio: auto; margin: auto; }}
 .video-layer, #screen {{ position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }}
 .video-layer {{ object-fit: contain; pointer-events: none; background: #000; transform: translateZ(0); backface-visibility: hidden; }}
+.video-layer.is-hidden {{ display: none; }}
 video.video-layer {{ opacity: 0; }}
 video.video-layer.is-playing {{ opacity: 1; }}
 #screen {{ outline: none; user-select: none; -webkit-user-select: none; touch-action: none; cursor: default; z-index: 2; }}
 #state {{ display: none; }}
+#controls {{ position: fixed; top: 10px; right: 10px; z-index: 20; display: flex; gap: 6px; opacity: 0.38; transition: opacity 120ms ease; }}
+#controls:hover, #controls:focus-within {{ opacity: 1; }}
+.segmented {{ display: flex; padding: 2px; gap: 2px; background: rgba(17, 24, 39, 0.72); border: 1px solid rgba(255, 255, 255, 0.24); border-radius: 6px; }}
+.mode-button {{ min-width: 48px; height: 28px; padding: 0 9px; border: 0; border-radius: 4px; background: transparent; color: #d1d5db; font-size: 13px; cursor: pointer; }}
+.mode-button.active {{ background: #f3f4f6; color: #111827; }}
 </style>
 </head>
 <body>
 <span id="state">video {width}x{height}, click image then type</span>
-<div id="stage">
+<div id="controls">
+  <div id="displayMode" class="segmented" role="group" aria-label="Display mode">
+    <button class="mode-button" type="button" data-mode="fit">Fit</button>
+    <button class="mode-button" type="button" data-mode="native">1:1</button>
+  </div>
+</div>
+<div id="stage" class="fit">
   <div id="viewport">
     {media}
     <div id="screen" tabindex="0"></div>
@@ -229,6 +277,10 @@ const EVT_MOVE = {MOUSE_EVENT_MOVE};
 const EVT_DOWN = {MOUSE_EVENT_DOWN};
 const EVT_UP = {MOUSE_EVENT_UP};
 const EVT_DBLCLICK = {MOUSE_EVENT_DBLCLICK};
+const stage = document.getElementById("stage");
+const viewport = document.getElementById("viewport");
+const displayModeButtons = Array.from(document.querySelectorAll("[data-mode]"));
+const DISPLAY_MODE_KEY = "rk3588-kvm-display-mode";
 let webrtcReader = null;
 {webrtc_setup}
 const img = document.getElementById("screen");
@@ -238,6 +290,38 @@ let mouseSocketTimer = null;
 let heartbeatTimer = null;
 let pendingMove = null;
 let moveTimer = null;
+
+function updateNativeSize() {{
+  const dpr = Math.max(window.devicePixelRatio || 1, 1);
+  document.documentElement.style.setProperty("--native-width", (W / dpr) + "px");
+  document.documentElement.style.setProperty("--native-height", (H / dpr) + "px");
+}}
+
+function setDisplayMode(mode, persist = true) {{
+  const nextMode = mode === "native" ? "native" : "fit";
+  updateNativeSize();
+  stage.classList.toggle("native", nextMode === "native");
+  stage.classList.toggle("fit", nextMode === "fit");
+  displayModeButtons.forEach(button => {{
+    const active = button.dataset.mode === nextMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  }});
+  if (persist) localStorage.setItem(DISPLAY_MODE_KEY, nextMode);
+  window.requestAnimationFrame(() => img.focus());
+}}
+
+displayModeButtons.forEach(button => {{
+  button.addEventListener("click", ev => {{
+    ev.preventDefault();
+    ev.stopPropagation();
+    setDisplayMode(button.dataset.mode);
+  }});
+}});
+window.addEventListener("resize", updateNativeSize);
+setDisplayMode(localStorage.getItem(DISPLAY_MODE_KEY) || "fit", false);
+
+{("startLowLatencyWebRTC();" if webrtc else "")}
 
 function coords(ev) {{
   const r = img.getBoundingClientRect();
@@ -423,7 +507,6 @@ window.addEventListener("blur", () => {{
 window.addEventListener("beforeunload", () => sendKey({{ action: "reset" }}));
 
 ensureMouseSocket();
-{("startLowLatencyWebRTC();" if webrtc else "")}
 img.focus();
 
 window.addEventListener("beforeunload", () => {{
@@ -654,6 +737,31 @@ class ExternalFrameGrabber:
                 "active_pipeline": "external MPP H264/WebRTC",
                 "last_error": "" if self._latest is not None else f"frame file not ready: {self.frame_file}",
             }
+
+    def close(self) -> None:
+        return
+
+
+class ExternalStreamGrabber:
+    def __init__(self) -> None:
+        self._started_at = time.monotonic()
+
+    def latest(self) -> tuple[int, Optional[bytes]]:
+        return 0, None
+
+    def latest_full_jpeg(self, quality: int | None = None) -> tuple[int, Optional[bytes], float | None]:
+        return 0, None, None
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "frame_age": None,
+            "frame_id": 0,
+            "frame_bytes": 0,
+            "capture_fps": None,
+            "active_pipeline": "external MPP H264 WebRTC",
+            "last_error": "",
+            "stream_uptime": round(time.monotonic() - self._started_at, 2),
+        }
 
     def close(self) -> None:
         return
@@ -1070,7 +1178,9 @@ class HidDevices:
 class KvmState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        if args.frame_file:
+        if args.external_stream:
+            self.grabber = ExternalStreamGrabber()
+        elif args.frame_file:
             self.grabber = ExternalFrameGrabber(args.frame_file)
         else:
             self.grabber = FrameGrabber(
@@ -1349,6 +1459,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quality", type=int, default=68)
     parser.add_argument("--scale-width", type=int, default=960)
     parser.add_argument("--frame-file", default="")
+    parser.add_argument("--external-stream", action="store_true")
     parser.add_argument("--webrtc", action="store_true")
     return parser.parse_args()
 

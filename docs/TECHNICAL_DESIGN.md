@@ -17,12 +17,10 @@ The KVM has two jobs:
 ```text
                   HDMI RX /dev/video40
                          |
-                    GStreamer tee
-                    /          \
-          MPP H.264 encode    JPEG 2 FPS
-                  |           snapshot
-               RTP/UDP          |
-                  |       /api/frame.jpg
+                GStreamer / MPP H.264
+                         |
+                      RTP/UDP
+                         |
                MediaMTX
                   |
             WebRTC 1080p
@@ -37,8 +35,8 @@ The KVM has two jobs:
 ```
 
 The design uses one video capture owner. Two independent programs must not open
-`/dev/video40` at the same time. The server therefore captures once and splits
-the stream internally.
+`/dev/video40` at the same time. In normal operation `stream_mpp.sh` owns HDMI
+RX and Python handles only the browser UI plus HID input.
 
 ## 3. Hardware Interfaces
 
@@ -102,7 +100,7 @@ coordinates `0..32767`.
 2. Refuses to start if `/dev/video40`, `/dev/hidg0`, or `/dev/hidg1` is absent.
 3. Starts MediaMTX for WebRTC signaling and transport.
 4. Starts `stream_mpp.sh` as the only `/dev/video40` owner.
-5. Starts `rk3588_kvm.py` for the UI, HID and snapshot API.
+5. Starts `rk3588_kvm.py` for the UI and HID API.
 6. Writes separate PID and log files under `/tmp`.
 
 `stream_watchdog.sh` supervises the GStreamer worker through MediaMTX's local
@@ -124,20 +122,15 @@ The preferred GStreamer pipeline is:
 ```text
 v4l2src device=/dev/video40 io-mode=2 do-timestamp=true
   ! video/x-raw,format=BGR
-  ! tee name=t
-    t. ! queue leaky=downstream max-size-buffers=1
-       ! videorate drop-only=true max-rate=<detected source fps>
-       ! videoscale
-       ! video/x-raw,format=BGR,width=1920,height=1080,framerate=<fps>/1
-       ! mpph264enc bps=16000000 bps-min=16000000 bps-max=16000000
-         gop=15 profile=100 level=42 max-reenc=0 qos=true zero-copy-pkt=false
-       ! h264parse ! rtph264pay pt=96 aggregate-mode=zero-latency
-       ! udpsink port=5004
-    t. ! queue leaky=downstream max-size-buffers=1
-       ! videoconvert ! videoscale
-       ! video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1
-       ! videorate drop-only=true max-rate=2 ! jpegenc quality=90
-       ! multifilesink location=/tmp/rk3588_kvm_latest.jpg
+  ! queue leaky=downstream max-size-buffers=1
+  ! videorate drop-only=true max-rate=<detected source fps>
+  ! videoscale
+  ! video/x-raw,format=BGR,width=1920,height=1080,framerate=<fps>/1
+  ! mpph264enc bps=12000000 bps-min=500000 bps-max=24000000 rc-mode=0
+    gop=60 qp-init=24 qp-min=16 qp-max=32
+    profile=100 level=42 max-reenc=1 qos=true zero-copy-pkt=false
+  ! h264parse ! rtph264pay pt=96 aggregate-mode=zero-latency
+  ! udpsink port=5004
 ```
 
 `io-mode=2` is mandatory on the tested board. `io-mode=4` DMA-BUF BGR input
@@ -165,8 +158,8 @@ Endpoints:
 
 ```text
 GET  /              Browser KVM UI
-GET  /stream.mjpg   Legacy MJPEG fallback
-GET  /api/frame.jpg Latest 1920x1080 vision snapshot
+GET  /stream.mjpg   Legacy MJPEG fallback when MediaMTX is unavailable
+GET  /api/frame.jpg Legacy JPEG snapshot endpoint when using fallback capture
 GET  /api/status    Runtime diagnostics
 POST /api/mouse     Absolute mouse event
 POST /api/key       Keyboard event
@@ -177,18 +170,29 @@ The normal browser stream is served by MediaMTX:
 ```text
 H.264 High, level 4.2
 1920x1080 output, source-matched frame rate
-16 Mbps CBR target
+12 Mbps VBR target, 24 Mbps peak
+GOP 60, QP 16-32, one adaptive re-encode attempt
 WebRTC HTTP: 8889
 WebRTC ICE:  8189 UDP/TCP
 ```
 
 The Python UI embeds the MediaMTX player while a transparent overlay captures
-mouse and keyboard events. The bridge vision path continues to use a separate
-full-resolution JPEG snapshot without opening `/dev/video40`.
+mouse and keyboard events. In normal systemd operation Python does not open
+`/dev/video40`; the capture device is owned by the external MPP H.264 pipeline.
 
-The stream handler tracks `frame_id` and only sends a new JPEG when the capture
-thread has encoded a new frame. This prevents duplicate-frame loops from wasting
-network bandwidth.
+The top-right display control offers two modes:
+
+```text
+Fit  Scale the 16:9 picture to the largest browser size that fits.
+1:1   Map each 1920x1080 source pixel to one physical display pixel, accounting
+      for browser devicePixelRatio, and allow scrolling when it cannot fit.
+```
+
+The selected mode is stored in browser local storage.
+
+WebRTC is the only normal video transport. The old MJPEG clarity mode is
+intentionally removed from the normal pipeline. This avoids continuous JPEG
+encoding, high MJPEG bandwidth, and repeated writes to a frame cache file.
 
 ## 7. Keyboard Handling
 
